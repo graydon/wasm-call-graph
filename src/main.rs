@@ -298,6 +298,7 @@ pub fn enumerate_call_chains(
         );
     }
 
+    results.sort();
     results
 }
 
