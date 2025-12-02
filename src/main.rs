@@ -88,6 +88,7 @@ pub struct CallGraphData {
     pub function_names: HashMap<u32, String>,
     pub call_graph: HashMap<u32, Vec<u32>>,
     pub all_function_indices: Vec<u32>,
+    pub imported_functions: HashSet<u32>,
 }
 
 /// Parse a wasm module and extract call graph data
@@ -101,6 +102,7 @@ pub fn parse_wasm_module(
     let mut call_graph: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut current_func_index: u32 = 0;
     let mut all_function_indices: Vec<u32> = Vec::new();
+    let mut imported_functions: HashSet<u32> = HashSet::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
         let payload = payload?;
@@ -122,7 +124,8 @@ pub fn parse_wasm_module(
                             format!("{}:{}", import.module, import.name)
                         };
                         function_names.insert(num_imported_functions, name);
-                        all_function_indices.push(num_imported_functions);
+                        imported_functions.insert(num_imported_functions);
+                        // Note: imports are NOT added to all_function_indices
                         num_imported_functions += 1;
                     }
                 }
@@ -197,6 +200,7 @@ pub fn parse_wasm_module(
         function_names,
         call_graph,
         all_function_indices,
+        imported_functions,
     })
 }
 
@@ -621,6 +625,12 @@ mod tests {
             Some(&"obj_to_u64".to_string())
         );
 
+        // Check that imports are tracked
+        assert!(data.imported_functions.contains(&0));
+        assert!(data.imported_functions.contains(&1));
+        assert!(!data.imported_functions.contains(&2)); // main is not an import
+
+        // Imports should appear as destinations in call chains
         let chains = enumerate_call_chains(&data, &["main".to_string()], &[]);
         assert!(chains.contains(&"main".to_string()));
         assert!(chains.contains(&"main,log_from_linear_memory".to_string()));
@@ -734,5 +744,72 @@ mod tests {
         assert!(chains.contains(&"b,c,d".to_string()));
         assert!(chains.contains(&"b,c,e".to_string()));
         assert_eq!(chains.len(), 4);
+    }
+
+    #[test]
+    fn test_imports_not_standalone() {
+        // Test that imports appear as destinations but not as standalone entries
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "external_func" (func $ext))
+                (func $a (call $ext) (call $b))
+                (func $b (call $ext))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+
+        // Verify import tracking
+        assert!(data.imported_functions.contains(&0)); // $ext is index 0
+        assert!(!data.imported_functions.contains(&1)); // $a is index 1
+        assert!(!data.imported_functions.contains(&2)); // $b is index 2
+
+        // Imports should not be in all_function_indices (not starting points)
+        assert!(!data.all_function_indices.contains(&0));
+        assert!(data.all_function_indices.contains(&1));
+        assert!(data.all_function_indices.contains(&2));
+
+        let chains = enumerate_call_chains(&data, &[], &[]);
+
+        // Should have chains for a and b as starting points
+        // Imports should appear as destinations when called (name is "ext" from WAT $ext)
+        assert!(chains.contains(&"a".to_string()));
+        assert!(chains.contains(&"a,ext".to_string())); // import as destination
+        assert!(chains.contains(&"a,b".to_string()));
+        assert!(chains.contains(&"a,b,ext".to_string())); // import as destination
+        assert!(chains.contains(&"b".to_string()));
+        assert!(chains.contains(&"b,ext".to_string())); // import as destination
+
+        // Import should NOT appear as a standalone entry
+        assert!(!chains.contains(&"ext".to_string()));
+
+        assert_eq!(chains.len(), 6);
+    }
+
+    #[test]
+    fn test_imports_not_as_starting_point() {
+        // Verify that imports cannot be used as src filter targets
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "external_func" (func $ext))
+                (func $a (call $ext))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+
+        // Try to filter by import name - should return empty since imports aren't starting points
+        // (name is "ext" from WAT $ext due to name section)
+        let chains = enumerate_call_chains(&data, &["ext".to_string()], &[]);
+        assert!(chains.is_empty());
+
+        // But imports can be used as dst filter targets
+        let chains = enumerate_call_chains(&data, &[], &["ext".to_string()]);
+        assert!(chains.contains(&"a,ext".to_string()));
+        assert_eq!(chains.len(), 1);
     }
 }
