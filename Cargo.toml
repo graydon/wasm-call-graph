@@ -1,0 +1,13 @@
+[package]
+name = "wasm-call-graph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmparser = "0.240"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+
+[dev-dependencies]
+wat = "1.0"
