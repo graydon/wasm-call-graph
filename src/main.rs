@@ -37,6 +37,10 @@ struct Args {
     /// Print filename prefix on each output line (default: false for 1 file, true for >1 files)
     #[arg(long, value_parser = parse_bool_arg)]
     filename: Option<bool>,
+
+    /// Only print starting function and final imports (leaf nodes), omitting internal functions
+    #[arg(long)]
+    leaves_only: bool,
 }
 
 fn parse_bool_arg(s: &str) -> Result<bool, String> {
@@ -89,6 +93,7 @@ pub struct CallGraphData {
     pub call_graph: HashMap<u32, Vec<u32>>,
     pub all_function_indices: Vec<u32>,
     pub imported_functions: HashSet<u32>,
+    pub exported_functions: HashSet<u32>,
 }
 
 /// Parse a wasm module and extract call graph data
@@ -103,6 +108,7 @@ pub fn parse_wasm_module(
     let mut current_func_index: u32 = 0;
     let mut all_function_indices: Vec<u32> = Vec::new();
     let mut imported_functions: HashSet<u32> = HashSet::new();
+    let mut exported_functions: HashSet<u32> = HashSet::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
         let payload = payload?;
@@ -138,6 +144,7 @@ pub fn parse_wasm_module(
                         if !env_translated.contains(&export.index) {
                             function_names.insert(export.index, export.name.to_string());
                         }
+                        exported_functions.insert(export.index);
                     }
                 }
             }
@@ -201,6 +208,7 @@ pub fn parse_wasm_module(
         call_graph,
         all_function_indices,
         imported_functions,
+        exported_functions,
     })
 }
 
@@ -210,6 +218,7 @@ pub fn enumerate_call_chains(
     data: &CallGraphData,
     src_filter: &[String],
     dst_filter: &[String],
+    leaves_only: bool,
 ) -> Vec<String> {
     let mut results = Vec::new();
 
@@ -217,10 +226,12 @@ pub fn enumerate_call_chains(
         func_idx: u32,
         call_graph: &HashMap<u32, Vec<u32>>,
         function_names: &HashMap<u32, String>,
+        imported_functions: &HashSet<u32>,
         current_path: &mut Vec<u32>,
         visited: &mut HashSet<u32>,
         results: &mut Vec<String>,
         dst_filter: &[String],
+        leaves_only: bool,
     ) {
         current_path.push(func_idx);
         visited.insert(func_idx);
@@ -236,15 +247,26 @@ pub fn enumerate_call_chains(
             })
             .collect();
 
+        // A leaf is an imported function (callable from runtime, has no callees in call graph)
+        let is_import = imported_functions.contains(&func_idx);
+
         // Check if we should include this path based on dst_filter
-        let should_include = if dst_filter.is_empty() {
+        let passes_dst_filter = if dst_filter.is_empty() {
             true
         } else {
             path_names.last().map_or(false, |last| dst_filter.iter().any(|d| d == *last))
         };
 
+        // When leaves_only is true, only include paths that end at an import
+        let should_include = passes_dst_filter && (!leaves_only || is_import);
+
         if should_include {
-            results.push(path_names.join(","));
+            if leaves_only && path_names.len() > 1 {
+                // Only output start and end (leaf)
+                results.push(format!("{},{}", path_names[0], path_names[path_names.len() - 1]));
+            } else {
+                results.push(path_names.join(","));
+            }
         }
 
         // Continue DFS to non-visited callees
@@ -255,10 +277,12 @@ pub fn enumerate_call_chains(
                         callee,
                         call_graph,
                         function_names,
+                        imported_functions,
                         current_path,
                         visited,
                         results,
                         dst_filter,
+                        leaves_only,
                     );
                 }
             }
@@ -269,10 +293,22 @@ pub fn enumerate_call_chains(
     }
 
     // Determine which functions to start from
-    let start_functions: Vec<u32> = if src_filter.is_empty() {
-        data.all_function_indices.clone()
+    // When leaves_only is true, only start from exported functions
+    let candidate_functions: &[u32] = if leaves_only {
+        // Filter to only exported functions
+        &data.all_function_indices
+            .iter()
+            .filter(|idx| data.exported_functions.contains(idx))
+            .copied()
+            .collect::<Vec<_>>()
     } else {
-        data.all_function_indices
+        &data.all_function_indices
+    };
+
+    let start_functions: Vec<u32> = if src_filter.is_empty() {
+        candidate_functions.to_vec()
+    } else {
+        candidate_functions
             .iter()
             .filter(|&&idx| {
                 data.function_names
@@ -291,10 +327,12 @@ pub fn enumerate_call_chains(
             func_idx,
             &data.call_graph,
             &data.function_names,
+            &data.imported_functions,
             &mut current_path,
             &mut visited,
             &mut results,
             dst_filter,
+            leaves_only,
         );
     }
 
@@ -326,7 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(file_path);
 
         let data = parse_wasm_module(&wasm_bytes, env_symbol_map.as_ref())?;
-        let chains = enumerate_call_chains(&data, &args.src, &args.dst);
+        let chains = enumerate_call_chains(&data, &args.src, &args.dst, args.leaves_only);
 
         for chain in &chains {
             if show_filename {
@@ -367,7 +405,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &[]);
+        let chains = enumerate_call_chains(&data, &[], &[], false);
 
         // Should have chains: a, a->b, a->b->c, b, b->c, c
         assert!(chains.contains(&"a".to_string()));
@@ -389,7 +427,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &[]);
+        let chains = enumerate_call_chains(&data, &[], &[], false);
 
         // Should only have "recursive" - recursion is inhibited
         assert_eq!(chains.len(), 1);
@@ -408,7 +446,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &[]);
+        let chains = enumerate_call_chains(&data, &[], &[], false);
 
         // Starting from a: a, a->b (can't go back to a)
         // Starting from b: b, b->a (can't go back to b)
@@ -432,7 +470,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &[]);
+        let chains = enumerate_call_chains(&data, &[], &[], false);
 
         // Starting from a: a, a->b, a->b->c (can't go back to a)
         // Starting from b: b, b->c, b->c->a (can't go back to b)
@@ -463,7 +501,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &[]);
+        let chains = enumerate_call_chains(&data, &[], &[], false);
 
         // Starting from a: a, a->b, a->b->c, a->b->c->d (can't go back to a)
         assert!(chains.contains(&"a".to_string()));
@@ -491,7 +529,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &["b".to_string()], &[]);
+        let chains = enumerate_call_chains(&data, &["b".to_string()], &[], false);
 
         // Should only have chains starting from b: b, b->c
         assert!(chains.contains(&"b".to_string()));
@@ -512,7 +550,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &["c".to_string()]);
+        let chains = enumerate_call_chains(&data, &[], &["c".to_string()], false);
 
         // Should only have chains ending at c
         assert!(chains.contains(&"a,b,c".to_string()));
@@ -534,7 +572,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &["a".to_string()], &["c".to_string()]);
+        let chains = enumerate_call_chains(&data, &["a".to_string()], &["c".to_string()], false);
 
         // Should only have a->b->c
         assert!(chains.contains(&"a,b,c".to_string()));
@@ -555,7 +593,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &["a".to_string()], &["d".to_string()]);
+        let chains = enumerate_call_chains(&data, &["a".to_string()], &["d".to_string()], false);
 
         // Should have a->b->d and a->c->d
         assert!(chains.contains(&"a,b,d".to_string()));
@@ -575,7 +613,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &["nonexistent".to_string()], &[]);
+        let chains = enumerate_call_chains(&data, &["nonexistent".to_string()], &[], false);
 
         assert!(chains.is_empty());
     }
@@ -592,7 +630,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &[], &["nonexistent".to_string()]);
+        let chains = enumerate_call_chains(&data, &[], &["nonexistent".to_string()], false);
 
         assert!(chains.is_empty());
     }
@@ -632,7 +670,7 @@ mod tests {
         assert!(!data.imported_functions.contains(&2)); // main is not an import
 
         // Imports should appear as destinations in call chains
-        let chains = enumerate_call_chains(&data, &["main".to_string()], &[]);
+        let chains = enumerate_call_chains(&data, &["main".to_string()], &[], false);
         assert!(chains.contains(&"main".to_string()));
         assert!(chains.contains(&"main,log_from_linear_memory".to_string()));
         assert!(chains.contains(&"main,obj_to_u64".to_string()));
@@ -654,7 +692,7 @@ mod tests {
         );
 
         let data = parse_wasm_module(&wasm, None).unwrap();
-        let chains = enumerate_call_chains(&data, &["a".to_string()], &[]);
+        let chains = enumerate_call_chains(&data, &["a".to_string()], &[], false);
 
         // From a: a, a->b, a->b->c, a->b->c->d (can't go to b), a->b->c->e
         assert!(chains.contains(&"a".to_string()));
@@ -679,7 +717,7 @@ mod tests {
 
         let data = parse_wasm_module(&wasm, None).unwrap();
         // Search for chains starting from either 'a' or 'b'
-        let chains = enumerate_call_chains(&data, &["a".to_string(), "b".to_string()], &[]);
+        let chains = enumerate_call_chains(&data, &["a".to_string(), "b".to_string()], &[], false);
 
         // From a: a, a->c, a->c->d
         // From b: b, b->c, b->c->d
@@ -706,7 +744,7 @@ mod tests {
 
         let data = parse_wasm_module(&wasm, None).unwrap();
         // Search for chains ending at either 'b' or 'c'
-        let chains = enumerate_call_chains(&data, &[], &["b".to_string(), "c".to_string()]);
+        let chains = enumerate_call_chains(&data, &[], &["b".to_string(), "c".to_string()], false);
 
         // Chains ending at b or c
         assert!(chains.contains(&"a,b".to_string()));
@@ -736,6 +774,7 @@ mod tests {
             &data,
             &["a".to_string(), "b".to_string()],
             &["d".to_string(), "e".to_string()],
+            false,
         );
 
         // From a ending at d or e: a->c->d, a->c->e
@@ -772,7 +811,7 @@ mod tests {
         assert!(data.all_function_indices.contains(&1));
         assert!(data.all_function_indices.contains(&2));
 
-        let chains = enumerate_call_chains(&data, &[], &[]);
+        let chains = enumerate_call_chains(&data, &[], &[], false);
 
         // Should have chains for a and b as starting points
         // Imports should appear as destinations when called (name is "ext" from WAT $ext)
@@ -805,12 +844,80 @@ mod tests {
 
         // Try to filter by import name - should return empty since imports aren't starting points
         // (name is "ext" from WAT $ext due to name section)
-        let chains = enumerate_call_chains(&data, &["ext".to_string()], &[]);
+        let chains = enumerate_call_chains(&data, &["ext".to_string()], &[], false);
         assert!(chains.is_empty());
 
         // But imports can be used as dst filter targets
-        let chains = enumerate_call_chains(&data, &[], &["ext".to_string()]);
+        let chains = enumerate_call_chains(&data, &[], &["ext".to_string()], false);
         assert!(chains.contains(&"a,ext".to_string()));
         assert_eq!(chains.len(), 1);
+    }
+
+    #[test]
+    fn test_leaves_only() {
+        // leaves_only: start from exports, end at imports
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "log" (func $log))
+                (import "env" "print" (func $print))
+                (func $a (export "a") (call $b) (call $log))
+                (func $b (call $c) (call $print))
+                (func $c (call $log))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let chains = enumerate_call_chains(&data, &[], &[], true);
+
+        // With leaves_only, should only show exported start -> imported leaf pairs
+        // From a (exported): a->log, a->b->print, a->b->c->log
+        assert!(chains.contains(&"a,log".to_string()));
+        assert!(chains.contains(&"a,print".to_string()));
+        // Should not contain intermediate paths like a,b or a,b,c
+        assert!(!chains.iter().any(|c| c == "a,b" || c == "a,b,c"));
+    }
+
+    #[test]
+    fn test_leaves_only_no_imports() {
+        // When there are no imports, leaves_only returns nothing (no valid leaves)
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $a (export "a") (call $b))
+                (func $b (call $c))
+                (func $c)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let chains = enumerate_call_chains(&data, &[], &[], true);
+
+        // No imports means no valid leaves, so no results
+        assert!(chains.is_empty());
+    }
+
+    #[test]
+    fn test_leaves_only_multiple_exports() {
+        // Multiple exported functions, each reaching imports
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "log" (func $log))
+                (func $a (export "a") (call $log))
+                (func $b (export "b") (call $log))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let chains = enumerate_call_chains(&data, &[], &[], true);
+
+        // Both exports should have paths to the import
+        assert!(chains.contains(&"a,log".to_string()));
+        assert!(chains.contains(&"b,log".to_string()));
+        assert_eq!(chains.len(), 2);
     }
 }
