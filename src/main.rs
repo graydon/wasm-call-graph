@@ -418,19 +418,21 @@ impl CallNode {
 
     /// Filter the tree to only include nodes that match the pattern or are on the path to matching nodes.
     /// The pattern must be matched in order across the tree traversal.
+    /// Each pattern element is a Vec of alternatives (e.g., ["X", "Y"] means X or Y).
     /// Returns Some(filtered_node) if this subtree contributes to matching the pattern.
-    fn filter_by_pattern(&self, remaining_pattern: &[String]) -> Option<CallNode> {
+    fn filter_by_pattern(&self, remaining_pattern: &[Vec<String>]) -> Option<CallNode> {
         self.filter_by_pattern_inner(remaining_pattern).0
     }
 
     /// Inner helper that returns (filtered_node, remaining_pattern_after_subtree)
-    fn filter_by_pattern_inner<'a>(&self, remaining_pattern: &'a [String]) -> (Option<CallNode>, &'a [String]) {
+    fn filter_by_pattern_inner<'a>(&self, remaining_pattern: &'a [Vec<String>]) -> (Option<CallNode>, &'a [Vec<String>]) {
         if remaining_pattern.is_empty() {
             // Pattern fully matched, no need to include more nodes
             return (None, remaining_pattern);
         }
 
-        let matches_current = remaining_pattern[0] == self.name;
+        // Check if this node matches any alternative in the current pattern element
+        let matches_current = remaining_pattern[0].iter().any(|alt| alt == &self.name);
         let pattern_after_self = if matches_current {
             &remaining_pattern[1..]
         } else {
@@ -467,10 +469,11 @@ impl CallNode {
 
 /// Generate sequential call summaries in format X{A{C,D},B}
 /// For loops (repeated calls to same function), unroll twice.
+/// Pattern elements can contain alternatives separated by |.
 pub fn generate_call_paths(
     data: &CallGraphData,
     src_filter: &[String],
-    path_pattern: Option<&[String]>,
+    path_pattern: Option<&[Vec<String>]>,
 ) -> Vec<String> {
     let mut results = Vec::new();
 
@@ -557,7 +560,8 @@ pub fn generate_call_paths(
 }
 
 /// Check if a call tree matches a path pattern.
-fn matches_path_pattern_tree(tree: &CallNode, pattern: &[String]) -> bool {
+/// Each pattern element is a Vec of alternatives.
+fn matches_path_pattern_tree(tree: &CallNode, pattern: &[Vec<String>]) -> bool {
     if pattern.is_empty() {
         return true;
     }
@@ -565,9 +569,10 @@ fn matches_path_pattern_tree(tree: &CallNode, pattern: &[String]) -> bool {
     let names = tree.names_in_order();
     
     // Check if pattern elements appear in order in names
+    // Each pattern element can match any of its alternatives
     let mut pattern_idx = 0;
     for name in &names {
-        if pattern_idx < pattern.len() && name == &pattern[pattern_idx] {
+        if pattern_idx < pattern.len() && pattern[pattern_idx].iter().any(|alt| alt == name) {
             pattern_idx += 1;
         }
     }
@@ -595,9 +600,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_paths = 0;
     
     // Parse path pattern if --paths was provided with a non-empty value
-    let path_pattern: Option<Vec<String>> = match &args.paths {
+    // Each element can have alternatives separated by |
+    let path_pattern: Option<Vec<Vec<String>>> = match &args.paths {
         Some(pattern) if !pattern.is_empty() => {
-            Some(pattern.split("..").map(|s| s.to_string()).collect())
+            Some(pattern.split("..")
+                .map(|s| s.split('|').map(|alt| alt.to_string()).collect())
+                .collect())
         }
         _ => None,
     };
@@ -661,6 +669,13 @@ mod tests {
 
     fn parse_wat(wat_source: &str) -> Vec<u8> {
         wat::parse_str(wat_source).expect("Failed to parse WAT")
+    }
+
+    /// Helper to create a pattern from strings. Each string can contain | for alternatives.
+    fn pat(elements: &[&str]) -> Vec<Vec<String>> {
+        elements.iter()
+            .map(|s| s.split('|').map(|alt| alt.to_string()).collect())
+            .collect()
     }
 
     #[test]
@@ -1258,17 +1273,17 @@ mod tests {
         let data = parse_wasm_module(&wasm, None).unwrap();
 
         // Pattern X..C..B should match and output only X{A{C},B} (D is filtered out)
-        let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "C".to_string(), "B".to_string()]));
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["X", "C", "B"])));
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], "X{A{C},B}");
 
         // Pattern X..B should match and output only X{B} (A and its children are filtered out)
-        let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "B".to_string()]));
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["X", "B"])));
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], "X{B}");
 
         // Pattern X..B..D should NOT match (B appears before D in the pattern, but D appears before B in summary)
-        let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "B".to_string(), "D".to_string()]));
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["X", "B", "D"])));
         assert!(paths.is_empty());
     }
 
@@ -1438,18 +1453,15 @@ mod tests {
         x.children.push(CallNode::new("B".to_string()));
 
         // Pattern X..C..B should filter to X{A{C},B}
-        let pattern = vec!["X".to_string(), "C".to_string(), "B".to_string()];
-        let filtered = x.filter_by_pattern(&pattern).unwrap();
+        let filtered = x.filter_by_pattern(&pat(&["X", "C", "B"])).unwrap();
         assert_eq!(filtered.to_string(), "X{A{C},B}");
 
         // Pattern X..B should filter to X{B}
-        let pattern = vec!["X".to_string(), "B".to_string()];
-        let filtered = x.filter_by_pattern(&pattern).unwrap();
+        let filtered = x.filter_by_pattern(&pat(&["X", "B"])).unwrap();
         assert_eq!(filtered.to_string(), "X{B}");
 
         // Pattern X..A..C should filter to X{A{C}}
-        let pattern = vec!["X".to_string(), "A".to_string(), "C".to_string()];
-        let filtered = x.filter_by_pattern(&pattern).unwrap();
+        let filtered = x.filter_by_pattern(&pat(&["X", "A", "C"])).unwrap();
         assert_eq!(filtered.to_string(), "X{A{C}}");
     }
 
@@ -1464,22 +1476,84 @@ mod tests {
         x.children.push(CallNode::new("B".to_string()));
 
         // X..C..B: X appears, then C, then B - should match
-        assert!(matches_path_pattern_tree(&x, &["X".to_string(), "C".to_string(), "B".to_string()]));
+        assert!(matches_path_pattern_tree(&x, &pat(&["X", "C", "B"])));
 
         // X..B: X appears, then B - should match
-        assert!(matches_path_pattern_tree(&x, &["X".to_string(), "B".to_string()]));
+        assert!(matches_path_pattern_tree(&x, &pat(&["X", "B"])));
 
         // X..B..D: X, then B, then D - should NOT match (D comes before B)
-        assert!(!matches_path_pattern_tree(&x, &["X".to_string(), "B".to_string(), "D".to_string()]));
+        assert!(!matches_path_pattern_tree(&x, &pat(&["X", "B", "D"])));
 
         // X..A..C: should match
-        assert!(matches_path_pattern_tree(&x, &["X".to_string(), "A".to_string(), "C".to_string()]));
+        assert!(matches_path_pattern_tree(&x, &pat(&["X", "A", "C"])));
 
         // Z..A: should NOT match (Z is not in tree)
-        assert!(!matches_path_pattern_tree(&x, &["Z".to_string(), "A".to_string()]));
+        assert!(!matches_path_pattern_tree(&x, &pat(&["Z", "A"])));
 
         // Empty pattern should match everything
         assert!(matches_path_pattern_tree(&x, &[]));
+    }
+
+    #[test]
+    fn test_pattern_alternatives() {
+        // X calls A and then B, A calls C and D
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $X (call $A) (call $B))
+                (func $A (call $C) (call $D))
+                (func $B)
+                (func $C)
+                (func $D)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+
+        // Pattern X..C|D..B should match (C or D, then B)
+        // C matches first, consuming the C|D element, then B matches
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["X", "C|D", "B"])));
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "X{A{C},B}");
+
+        // Pattern X..C|B should match C or B
+        // C matches first (via A), consuming the pattern
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["X", "C|B"])));
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "X{A{C}}");
+
+        // Pattern Y|X..B should match (Y or X, then B)
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["Y|X", "B"])));
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "X{B}");
+
+        // Pattern Z|W..B should NOT match (neither Z nor W is in tree)
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&pat(&["Z|W", "B"])));
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_pattern_alternatives_matching() {
+        // Build a tree: X{A{C,D},B}
+        let mut x = CallNode::new("X".to_string());
+        let mut a = CallNode::new("A".to_string());
+        a.children.push(CallNode::new("C".to_string()));
+        a.children.push(CallNode::new("D".to_string()));
+        x.children.push(a);
+        x.children.push(CallNode::new("B".to_string()));
+
+        // X|Y..C..B: X or Y, then C, then B - should match
+        assert!(matches_path_pattern_tree(&x, &pat(&["X|Y", "C", "B"])));
+
+        // Z|W..C..B: neither Z nor W is in tree - should NOT match
+        assert!(!matches_path_pattern_tree(&x, &pat(&["Z|W", "C", "B"])));
+
+        // X..C|D..B: C or D, then B - should match
+        assert!(matches_path_pattern_tree(&x, &pat(&["X", "C|D", "B"])));
+
+        // X..A..C|D: should match (C or D at the end)
+        assert!(matches_path_pattern_tree(&x, &pat(&["X", "A", "C|D"])));
     }
 
     #[test]
