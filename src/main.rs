@@ -353,6 +353,86 @@ pub fn enumerate_call_chains(
     results
 }
 
+/// A tree node representing a function call and its children
+#[derive(Debug, Clone)]
+struct CallNode {
+    name: String,
+    children: Vec<CallNode>,
+}
+
+impl CallNode {
+    fn new(name: String) -> Self {
+        CallNode { name, children: Vec::new() }
+    }
+
+    /// Convert the tree to a string in format X{A{C,D},B}
+    fn to_string(&self) -> String {
+        if self.children.is_empty() {
+            self.name.clone()
+        } else {
+            let child_strs: Vec<String> = self.children.iter().map(|c| c.to_string()).collect();
+            format!("{}{{{}}}", self.name, child_strs.join(","))
+        }
+    }
+
+    /// Extract all names in order (depth-first, pre-order)
+    fn names_in_order(&self) -> Vec<String> {
+        let mut names = vec![self.name.clone()];
+        for child in &self.children {
+            names.extend(child.names_in_order());
+        }
+        names
+    }
+
+    /// Filter the tree to only include nodes that match the pattern or are on the path to matching nodes.
+    /// The pattern must be matched in order across the tree traversal.
+    /// Returns Some(filtered_node) if this subtree contributes to matching the pattern.
+    fn filter_by_pattern(&self, remaining_pattern: &[String]) -> Option<CallNode> {
+        self.filter_by_pattern_inner(remaining_pattern).0
+    }
+
+    /// Inner helper that returns (filtered_node, remaining_pattern_after_subtree)
+    fn filter_by_pattern_inner<'a>(&self, remaining_pattern: &'a [String]) -> (Option<CallNode>, &'a [String]) {
+        if remaining_pattern.is_empty() {
+            // Pattern fully matched, no need to include more nodes
+            return (None, remaining_pattern);
+        }
+
+        let matches_current = remaining_pattern[0] == self.name;
+        let pattern_after_self = if matches_current {
+            &remaining_pattern[1..]
+        } else {
+            remaining_pattern
+        };
+
+        // If this node matches and pattern is now empty, include just this node
+        if matches_current && pattern_after_self.is_empty() {
+            return (Some(CallNode::new(self.name.clone())), pattern_after_self);
+        }
+
+        // Recursively filter children, consuming pattern elements as we go
+        let mut filtered_children = Vec::new();
+        let mut current_pattern = pattern_after_self;
+        
+        for child in &self.children {
+            let (filtered_child, pattern_after_child) = child.filter_by_pattern_inner(current_pattern);
+            if let Some(fc) = filtered_child {
+                filtered_children.push(fc);
+            }
+            current_pattern = pattern_after_child;
+        }
+
+        // Include this node if it matches the current pattern element, or if any child was included
+        if matches_current || !filtered_children.is_empty() {
+            let mut node = CallNode::new(self.name.clone());
+            node.children = filtered_children;
+            (Some(node), current_pattern)
+        } else {
+            (None, current_pattern)
+        }
+    }
+}
+
 /// Generate sequential call summaries in format X{A{C,D},B}
 /// For loops (repeated calls to same function), unroll twice.
 pub fn generate_call_paths(
@@ -362,15 +442,14 @@ pub fn generate_call_paths(
 ) -> Vec<String> {
     let mut results = Vec::new();
 
-    /// Build a call summary string for a function, recursively expanding callees.
-    /// visited tracks the current call stack to detect recursion.
+    /// Build a call tree for a function, recursively expanding callees.
     /// For loops, we unroll twice by allowing a function to appear at most twice in the path.
-    fn build_summary(
+    fn build_call_tree(
         func_idx: u32,
         ordered_calls: &HashMap<u32, Vec<u32>>,
         function_names: &HashMap<u32, String>,
         visit_counts: &mut HashMap<u32, u32>,
-    ) -> String {
+    ) -> CallNode {
         let name = function_names
             .get(&func_idx)
             .cloned()
@@ -379,36 +458,28 @@ pub fn generate_call_paths(
         // Check if we've already visited this function twice (loop unrolling limit)
         let count = *visit_counts.get(&func_idx).unwrap_or(&0);
         if count >= 2 {
-            return name;
+            return CallNode::new(name);
         }
 
         // Mark this function as visited
         *visit_counts.entry(func_idx).or_insert(0) += 1;
 
+        let mut node = CallNode::new(name);
+
         // Get the ordered calls for this function
-        let callees = ordered_calls.get(&func_idx);
-        
-        let result = if let Some(callees) = callees {
-            if callees.is_empty() {
-                name
-            } else {
-                let child_summaries: Vec<String> = callees
-                    .iter()
-                    .map(|&callee| build_summary(callee, ordered_calls, function_names, visit_counts))
-                    .collect();
-                format!("{}{{{}}}", name, child_summaries.join(","))
+        if let Some(callees) = ordered_calls.get(&func_idx) {
+            for &callee in callees {
+                let child = build_call_tree(callee, ordered_calls, function_names, visit_counts);
+                node.children.push(child);
             }
-        } else {
-            // No callees (e.g., imported function)
-            name
-        };
+        }
 
         // Unmark this function (decrement count)
         if let Some(c) = visit_counts.get_mut(&func_idx) {
             *c -= 1;
         }
 
-        result
+        node
     }
 
     // Determine which functions to start from
@@ -429,20 +500,23 @@ pub fn generate_call_paths(
 
     for func_idx in start_functions {
         let mut visit_counts: HashMap<u32, u32> = HashMap::new();
-        let summary = build_summary(
+        let tree = build_call_tree(
             func_idx,
             &data.ordered_calls,
             &data.function_names,
             &mut visit_counts,
         );
 
-        // Check if the summary matches the path pattern
+        // Check if the tree matches the path pattern
         if let Some(pattern) = path_pattern {
-            if matches_path_pattern(&summary, pattern) {
-                results.push(summary);
+            if matches_path_pattern_tree(&tree, pattern) {
+                // Filter the tree to only show matching paths
+                if let Some(filtered) = tree.filter_by_pattern(pattern) {
+                    results.push(filtered.to_string());
+                }
             }
         } else {
-            results.push(summary);
+            results.push(tree.to_string());
         }
     }
 
@@ -450,17 +524,13 @@ pub fn generate_call_paths(
     results
 }
 
-/// Check if a call summary matches a path pattern.
-/// Pattern is a sequence of function names that must appear in order in the summary.
-/// For example, pattern ["X", "C", "B"] matches "X{A{C,D},B}" because X appears,
-/// then C appears somewhere after, then B appears after C.
-fn matches_path_pattern(summary: &str, pattern: &[String]) -> bool {
+/// Check if a call tree matches a path pattern.
+fn matches_path_pattern_tree(tree: &CallNode, pattern: &[String]) -> bool {
     if pattern.is_empty() {
         return true;
     }
 
-    // Extract all function names in order from the summary
-    let names = extract_names_in_order(summary);
+    let names = tree.names_in_order();
     
     // Check if pattern elements appear in order in names
     let mut pattern_idx = 0;
@@ -471,33 +541,6 @@ fn matches_path_pattern(summary: &str, pattern: &[String]) -> bool {
     }
 
     pattern_idx == pattern.len()
-}
-
-/// Extract function names from a summary in the order they appear.
-/// For "X{A{C,D},B}", returns ["X", "A", "C", "D", "B"]
-fn extract_names_in_order(summary: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut current_name = String::new();
-
-    for ch in summary.chars() {
-        match ch {
-            '{' | '}' | ',' => {
-                if !current_name.is_empty() {
-                    names.push(current_name.clone());
-                    current_name.clear();
-                }
-            }
-            _ => {
-                current_name.push(ch);
-            }
-        }
-    }
-
-    if !current_name.is_empty() {
-        names.push(current_name);
-    }
-
-    names
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1173,14 +1216,15 @@ mod tests {
 
         let data = parse_wasm_module(&wasm, None).unwrap();
 
-        // Pattern X..C..B should match X{A{C,D},B} because C appears before B
+        // Pattern X..C..B should match and output only X{A{C},B} (D is filtered out)
         let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "C".to_string(), "B".to_string()]));
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], "X{A{C,D},B}");
+        assert_eq!(paths[0], "X{A{C},B}");
 
-        // Pattern X..B should match
+        // Pattern X..B should match and output only X{B} (A and its children are filtered out)
         let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "B".to_string()]));
         assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "X{B}");
 
         // Pattern X..B..D should NOT match (B appears before D in the pattern, but D appears before B in summary)
         let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "B".to_string(), "D".to_string()]));
@@ -1314,47 +1358,87 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_names_in_order() {
+    fn test_call_node_names_in_order() {
+        // Build a tree: X{A{C,D},B}
+        let mut x = CallNode::new("X".to_string());
+        let mut a = CallNode::new("A".to_string());
+        a.children.push(CallNode::new("C".to_string()));
+        a.children.push(CallNode::new("D".to_string()));
+        x.children.push(a);
+        x.children.push(CallNode::new("B".to_string()));
+
         assert_eq!(
-            extract_names_in_order("X{A{C,D},B}"),
+            x.names_in_order(),
             vec!["X", "A", "C", "D", "B"]
-        );
-        assert_eq!(
-            extract_names_in_order("a{b{c}}"),
-            vec!["a", "b", "c"]
-        );
-        assert_eq!(
-            extract_names_in_order("simple"),
-            vec!["simple"]
-        );
-        assert_eq!(
-            extract_names_in_order("a{b,c,d}"),
-            vec!["a", "b", "c", "d"]
         );
     }
 
     #[test]
-    fn test_matches_path_pattern() {
-        // X{A{C,D},B} -> names: X, A, C, D, B
-        let summary = "X{A{C,D},B}";
+    fn test_call_node_to_string() {
+        // Build a tree: X{A{C,D},B}
+        let mut x = CallNode::new("X".to_string());
+        let mut a = CallNode::new("A".to_string());
+        a.children.push(CallNode::new("C".to_string()));
+        a.children.push(CallNode::new("D".to_string()));
+        x.children.push(a);
+        x.children.push(CallNode::new("B".to_string()));
+
+        assert_eq!(x.to_string(), "X{A{C,D},B}");
+    }
+
+    #[test]
+    fn test_call_node_filter_by_pattern() {
+        // Build a tree: X{A{C,D},B}
+        let mut x = CallNode::new("X".to_string());
+        let mut a = CallNode::new("A".to_string());
+        a.children.push(CallNode::new("C".to_string()));
+        a.children.push(CallNode::new("D".to_string()));
+        x.children.push(a);
+        x.children.push(CallNode::new("B".to_string()));
+
+        // Pattern X..C..B should filter to X{A{C},B}
+        let pattern = vec!["X".to_string(), "C".to_string(), "B".to_string()];
+        let filtered = x.filter_by_pattern(&pattern).unwrap();
+        assert_eq!(filtered.to_string(), "X{A{C},B}");
+
+        // Pattern X..B should filter to X{B}
+        let pattern = vec!["X".to_string(), "B".to_string()];
+        let filtered = x.filter_by_pattern(&pattern).unwrap();
+        assert_eq!(filtered.to_string(), "X{B}");
+
+        // Pattern X..A..C should filter to X{A{C}}
+        let pattern = vec!["X".to_string(), "A".to_string(), "C".to_string()];
+        let filtered = x.filter_by_pattern(&pattern).unwrap();
+        assert_eq!(filtered.to_string(), "X{A{C}}");
+    }
+
+    #[test]
+    fn test_matches_path_pattern_tree() {
+        // Build a tree: X{A{C,D},B}
+        let mut x = CallNode::new("X".to_string());
+        let mut a = CallNode::new("A".to_string());
+        a.children.push(CallNode::new("C".to_string()));
+        a.children.push(CallNode::new("D".to_string()));
+        x.children.push(a);
+        x.children.push(CallNode::new("B".to_string()));
 
         // X..C..B: X appears, then C, then B - should match
-        assert!(matches_path_pattern(summary, &["X".to_string(), "C".to_string(), "B".to_string()]));
+        assert!(matches_path_pattern_tree(&x, &["X".to_string(), "C".to_string(), "B".to_string()]));
 
         // X..B: X appears, then B - should match
-        assert!(matches_path_pattern(summary, &["X".to_string(), "B".to_string()]));
+        assert!(matches_path_pattern_tree(&x, &["X".to_string(), "B".to_string()]));
 
-        // X..B..D: X, then B, then D - should NOT match (D comes before B in summary)
-        assert!(!matches_path_pattern(summary, &["X".to_string(), "B".to_string(), "D".to_string()]));
+        // X..B..D: X, then B, then D - should NOT match (D comes before B)
+        assert!(!matches_path_pattern_tree(&x, &["X".to_string(), "B".to_string(), "D".to_string()]));
 
         // X..A..C: should match
-        assert!(matches_path_pattern(summary, &["X".to_string(), "A".to_string(), "C".to_string()]));
+        assert!(matches_path_pattern_tree(&x, &["X".to_string(), "A".to_string(), "C".to_string()]));
 
-        // Z..A: should NOT match (Z is not in summary)
-        assert!(!matches_path_pattern(summary, &["Z".to_string(), "A".to_string()]));
+        // Z..A: should NOT match (Z is not in tree)
+        assert!(!matches_path_pattern_tree(&x, &["Z".to_string(), "A".to_string()]));
 
         // Empty pattern should match everything
-        assert!(matches_path_pattern(summary, &[]));
+        assert!(matches_path_pattern_tree(&x, &[]));
     }
 
     #[test]
