@@ -46,6 +46,11 @@ struct Args {
     /// Optionally provide a pattern separated by .. to filter output (e.g., --paths=X..C..B)
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "")]
     paths: Option<String>,
+
+    /// Add an implicit edge from an import to an export (host callback).
+    /// Format: IMPORT:EXPORT (can be specified multiple times)
+    #[arg(long)]
+    implicit_call: Vec<String>,
 }
 
 fn parse_bool_arg(s: &str) -> Result<bool, String> {
@@ -223,6 +228,50 @@ pub fn parse_wasm_module(
         imported_functions,
         exported_functions,
     })
+}
+
+/// Parse implicit call arguments and return a map from import name to export name
+fn parse_implicit_calls(args: &[String]) -> Result<HashMap<String, String>, String> {
+    let mut map = HashMap::new();
+    for arg in args {
+        if let Some((import, export)) = arg.split_once(":") {
+            map.insert(import.to_string(), export.to_string());
+        } else {
+            return Err(format!("Invalid implicit-call format '{}', expected IMPORT:EXPORT", arg));
+        }
+    }
+    Ok(map)
+}
+
+/// Apply implicit calls to the call graph data.
+/// For each import that has an implicit callback to an export, add an edge from the import to the export.
+pub fn apply_implicit_calls(data: &mut CallGraphData, implicit_calls: &HashMap<String, String>) {
+    // Build reverse lookup: function name -> function index
+    let name_to_idx: HashMap<&str, u32> = data.function_names
+        .iter()
+        .map(|(&idx, name)| (name.as_str(), idx))
+        .collect();
+
+    for (import_name, export_name) in implicit_calls {
+        // Find the import function index
+        let import_idx = name_to_idx.get(import_name.as_str());
+        // Find the export function index
+        let export_idx = name_to_idx.get(export_name.as_str());
+
+        if let (Some(&imp_idx), Some(&exp_idx)) = (import_idx, export_idx) {
+            // Add edge from import to export in call_graph
+            data.call_graph
+                .entry(imp_idx)
+                .or_insert_with(Vec::new)
+                .push(exp_idx);
+            
+            // Also add to ordered_calls for paths mode
+            data.ordered_calls
+                .entry(imp_idx)
+                .or_insert_with(Vec::new)
+                .push(exp_idx);
+        }
+    }
 }
 
 /// DFS to enumerate all call chains with recursion inhibition.
@@ -553,6 +602,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Parse implicit calls
+    let implicit_calls = parse_implicit_calls(&args.implicit_call)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
     // Determine whether to show filename prefix
     let show_filename = args.filename.unwrap_or(args.files.len() > 1);
 
@@ -576,7 +629,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.to_str())
             .unwrap_or(file_path);
 
-        let data = parse_wasm_module(&wasm_bytes, env_symbol_map.as_ref())?;
+        let mut data = parse_wasm_module(&wasm_bytes, env_symbol_map.as_ref())?;
+
+        // Apply implicit calls to add edges from imports to exports
+        if !implicit_calls.is_empty() {
+            apply_implicit_calls(&mut data, &implicit_calls);
+        }
 
         if use_paths_mode {
             let summaries = generate_call_paths(
@@ -1503,5 +1561,112 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&"a{c}".to_string()));
         assert!(paths.contains(&"b{c}".to_string()));
+    }
+
+    // ============================================================
+    // Tests for --implicit-call
+    // ============================================================
+
+    #[test]
+    fn test_implicit_call_parsing() {
+        let args = vec!["import1:export1".to_string(), "import2:export2".to_string()];
+        let map = parse_implicit_calls(&args).unwrap();
+        
+        assert_eq!(map.get("import1"), Some(&"export1".to_string()));
+        assert_eq!(map.get("import2"), Some(&"export2".to_string()));
+    }
+
+    #[test]
+    fn test_implicit_call_parsing_error() {
+        let args = vec!["invalid_format".to_string()];
+        let result = parse_implicit_calls(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_implicit_call_basic() {
+        // main calls an import, the import implicitly calls back to callback export
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "host_func" (func $host_func))
+                (func $main (export "main") (call $host_func))
+                (func $callback (export "callback") (call $helper))
+                (func $helper)
+            )
+            "#,
+        );
+
+        let mut data = parse_wasm_module(&wasm, None).unwrap();
+        
+        // Without implicit call, main only reaches host_func
+        let chains = enumerate_call_chains(&data, &["main".to_string()], &[], false);
+        assert!(chains.contains(&"main".to_string()));
+        assert!(chains.contains(&"main,host_func".to_string()));
+        assert!(!chains.iter().any(|c| c.contains("callback")));
+
+        // Add implicit call from host_func to callback
+        let mut implicit_calls = HashMap::new();
+        implicit_calls.insert("host_func".to_string(), "callback".to_string());
+        apply_implicit_calls(&mut data, &implicit_calls);
+
+        // Now main should reach callback through host_func
+        let chains = enumerate_call_chains(&data, &["main".to_string()], &[], false);
+        assert!(chains.contains(&"main,host_func,callback".to_string()));
+        assert!(chains.contains(&"main,host_func,callback,helper".to_string()));
+    }
+
+    #[test]
+    fn test_implicit_call_paths_mode() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "host_func" (func $host_func))
+                (func $main (export "main") (call $host_func))
+                (func $callback (export "callback") (call $helper))
+                (func $helper)
+            )
+            "#,
+        );
+
+        let mut data = parse_wasm_module(&wasm, None).unwrap();
+        
+        // Add implicit call from host_func to callback
+        let mut implicit_calls = HashMap::new();
+        implicit_calls.insert("host_func".to_string(), "callback".to_string());
+        apply_implicit_calls(&mut data, &implicit_calls);
+
+        // Check paths mode output
+        let paths = generate_call_paths(&data, &["main".to_string()], None);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "main{host_func{callback{helper}}}");
+    }
+
+    #[test]
+    fn test_implicit_call_multiple() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "host1" (func $host1))
+                (import "env" "host2" (func $host2))
+                (func $main (export "main") (call $host1) (call $host2))
+                (func $cb1 (export "cb1"))
+                (func $cb2 (export "cb2"))
+            )
+            "#,
+        );
+
+        let mut data = parse_wasm_module(&wasm, None).unwrap();
+        
+        // Add multiple implicit calls
+        let mut implicit_calls = HashMap::new();
+        implicit_calls.insert("host1".to_string(), "cb1".to_string());
+        implicit_calls.insert("host2".to_string(), "cb2".to_string());
+        apply_implicit_calls(&mut data, &implicit_calls);
+
+        // Check paths mode output
+        let paths = generate_call_paths(&data, &["main".to_string()], None);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "main{host1{cb1},host2{cb2}}");
     }
 }
