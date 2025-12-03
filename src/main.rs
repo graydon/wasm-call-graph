@@ -100,9 +100,8 @@ fn build_env_symbol_map(env_path: &str) -> Result<HashMap<String, String>, Box<d
 #[derive(Debug)]
 pub struct CallGraphData {
     pub function_names: HashMap<u32, String>,
+    /// Ordered calls with duplicates preserved
     pub call_graph: HashMap<u32, Vec<u32>>,
-    /// Ordered calls with duplicates preserved (for paths mode)
-    pub ordered_calls: HashMap<u32, Vec<u32>>,
     pub all_function_indices: Vec<u32>,
     pub imported_functions: HashSet<u32>,
     pub exported_functions: HashSet<u32>,
@@ -117,7 +116,6 @@ pub fn parse_wasm_module(
     let mut function_names: HashMap<u32, String> = HashMap::new();
     let mut env_translated: HashSet<u32> = HashSet::new(); // Track which names came from env translation
     let mut call_graph: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut ordered_calls: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut current_func_index: u32 = 0;
     let mut all_function_indices: Vec<u32> = Vec::new();
     let mut imported_functions: HashSet<u32> = HashSet::new();
@@ -183,30 +181,22 @@ pub fn parse_wasm_module(
                 let func_index = num_imported_functions + current_func_index;
                 all_function_indices.push(func_index);
                 let mut callees: Vec<u32> = Vec::new();
-                let mut all_calls: Vec<u32> = Vec::new();
 
                 let mut reader = body.get_operators_reader()?;
                 while !reader.eof() {
                     let op = reader.read()?;
                     match op {
                         Operator::Call { function_index } => {
-                            all_calls.push(function_index);
-                            if !callees.contains(&function_index) {
-                                callees.push(function_index);
-                            }
+                            callees.push(function_index);
                         }
                         Operator::ReturnCall { function_index } => {
-                            all_calls.push(function_index);
-                            if !callees.contains(&function_index) {
-                                callees.push(function_index);
-                            }
+                            callees.push(function_index);
                         }
                         _ => {}
                     }
                 }
 
                 call_graph.insert(func_index, callees);
-                ordered_calls.insert(func_index, all_calls);
                 current_func_index += 1;
             }
             _ => {}
@@ -223,7 +213,6 @@ pub fn parse_wasm_module(
     Ok(CallGraphData {
         function_names,
         call_graph,
-        ordered_calls,
         all_function_indices,
         imported_functions,
         exported_functions,
@@ -261,12 +250,6 @@ pub fn apply_implicit_calls(data: &mut CallGraphData, implicit_calls: &HashMap<S
         if let (Some(&imp_idx), Some(&exp_idx)) = (import_idx, export_idx) {
             // Add edge from import to export in call_graph
             data.call_graph
-                .entry(imp_idx)
-                .or_insert_with(Vec::new)
-                .push(exp_idx);
-            
-            // Also add to ordered_calls for paths mode
-            data.ordered_calls
                 .entry(imp_idx)
                 .or_insert_with(Vec::new)
                 .push(exp_idx);
@@ -495,7 +478,7 @@ pub fn generate_call_paths(
     /// For loops, we unroll twice by allowing a function to appear at most twice in the path.
     fn build_call_tree(
         func_idx: u32,
-        ordered_calls: &HashMap<u32, Vec<u32>>,
+        call_graph: &HashMap<u32, Vec<u32>>,
         function_names: &HashMap<u32, String>,
         visit_counts: &mut HashMap<u32, u32>,
     ) -> CallNode {
@@ -516,9 +499,9 @@ pub fn generate_call_paths(
         let mut node = CallNode::new(name);
 
         // Get the ordered calls for this function
-        if let Some(callees) = ordered_calls.get(&func_idx) {
+        if let Some(callees) = call_graph.get(&func_idx) {
             for &callee in callees {
-                let child = build_call_tree(callee, ordered_calls, function_names, visit_counts);
+                let child = build_call_tree(callee, call_graph, function_names, visit_counts);
                 node.children.push(child);
             }
         }
@@ -551,7 +534,7 @@ pub fn generate_call_paths(
         let mut visit_counts: HashMap<u32, u32> = HashMap::new();
         let tree = build_call_tree(
             func_idx,
-            &data.ordered_calls,
+            &data.call_graph,
             &data.function_names,
             &mut visit_counts,
         );
