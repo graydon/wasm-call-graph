@@ -41,6 +41,11 @@ struct Args {
     /// Only print starting function and final imports (leaf nodes), omitting internal functions
     #[arg(long)]
     leaves_only: bool,
+
+    /// Output sequential call summaries in format X{A{C,D},B} instead of call chains.
+    /// Optionally provide a pattern separated by .. to filter output (e.g., --paths=X..C..B)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    paths: Option<String>,
 }
 
 fn parse_bool_arg(s: &str) -> Result<bool, String> {
@@ -91,6 +96,8 @@ fn build_env_symbol_map(env_path: &str) -> Result<HashMap<String, String>, Box<d
 pub struct CallGraphData {
     pub function_names: HashMap<u32, String>,
     pub call_graph: HashMap<u32, Vec<u32>>,
+    /// Ordered calls with duplicates preserved (for paths mode)
+    pub ordered_calls: HashMap<u32, Vec<u32>>,
     pub all_function_indices: Vec<u32>,
     pub imported_functions: HashSet<u32>,
     pub exported_functions: HashSet<u32>,
@@ -105,6 +112,7 @@ pub fn parse_wasm_module(
     let mut function_names: HashMap<u32, String> = HashMap::new();
     let mut env_translated: HashSet<u32> = HashSet::new(); // Track which names came from env translation
     let mut call_graph: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut ordered_calls: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut current_func_index: u32 = 0;
     let mut all_function_indices: Vec<u32> = Vec::new();
     let mut imported_functions: HashSet<u32> = HashSet::new();
@@ -170,17 +178,20 @@ pub fn parse_wasm_module(
                 let func_index = num_imported_functions + current_func_index;
                 all_function_indices.push(func_index);
                 let mut callees: Vec<u32> = Vec::new();
+                let mut all_calls: Vec<u32> = Vec::new();
 
                 let mut reader = body.get_operators_reader()?;
                 while !reader.eof() {
                     let op = reader.read()?;
                     match op {
                         Operator::Call { function_index } => {
+                            all_calls.push(function_index);
                             if !callees.contains(&function_index) {
                                 callees.push(function_index);
                             }
                         }
                         Operator::ReturnCall { function_index } => {
+                            all_calls.push(function_index);
                             if !callees.contains(&function_index) {
                                 callees.push(function_index);
                             }
@@ -190,6 +201,7 @@ pub fn parse_wasm_module(
                 }
 
                 call_graph.insert(func_index, callees);
+                ordered_calls.insert(func_index, all_calls);
                 current_func_index += 1;
             }
             _ => {}
@@ -206,6 +218,7 @@ pub fn parse_wasm_module(
     Ok(CallGraphData {
         function_names,
         call_graph,
+        ordered_calls,
         all_function_indices,
         imported_functions,
         exported_functions,
@@ -340,6 +353,153 @@ pub fn enumerate_call_chains(
     results
 }
 
+/// Generate sequential call summaries in format X{A{C,D},B}
+/// For loops (repeated calls to same function), unroll twice.
+pub fn generate_call_paths(
+    data: &CallGraphData,
+    src_filter: &[String],
+    path_pattern: Option<&[String]>,
+) -> Vec<String> {
+    let mut results = Vec::new();
+
+    /// Build a call summary string for a function, recursively expanding callees.
+    /// visited tracks the current call stack to detect recursion.
+    /// For loops, we unroll twice by allowing a function to appear at most twice in the path.
+    fn build_summary(
+        func_idx: u32,
+        ordered_calls: &HashMap<u32, Vec<u32>>,
+        function_names: &HashMap<u32, String>,
+        visit_counts: &mut HashMap<u32, u32>,
+    ) -> String {
+        let name = function_names
+            .get(&func_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("func_{}", func_idx));
+
+        // Check if we've already visited this function twice (loop unrolling limit)
+        let count = *visit_counts.get(&func_idx).unwrap_or(&0);
+        if count >= 2 {
+            return name;
+        }
+
+        // Mark this function as visited
+        *visit_counts.entry(func_idx).or_insert(0) += 1;
+
+        // Get the ordered calls for this function
+        let callees = ordered_calls.get(&func_idx);
+        
+        let result = if let Some(callees) = callees {
+            if callees.is_empty() {
+                name
+            } else {
+                let child_summaries: Vec<String> = callees
+                    .iter()
+                    .map(|&callee| build_summary(callee, ordered_calls, function_names, visit_counts))
+                    .collect();
+                format!("{}{{{}}}", name, child_summaries.join(","))
+            }
+        } else {
+            // No callees (e.g., imported function)
+            name
+        };
+
+        // Unmark this function (decrement count)
+        if let Some(c) = visit_counts.get_mut(&func_idx) {
+            *c -= 1;
+        }
+
+        result
+    }
+
+    // Determine which functions to start from
+    let start_functions: Vec<u32> = if src_filter.is_empty() {
+        data.all_function_indices.clone()
+    } else {
+        data.all_function_indices
+            .iter()
+            .filter(|&&idx| {
+                data.function_names
+                    .get(&idx)
+                    .map(|name| src_filter.iter().any(|s| s == name))
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect()
+    };
+
+    for func_idx in start_functions {
+        let mut visit_counts: HashMap<u32, u32> = HashMap::new();
+        let summary = build_summary(
+            func_idx,
+            &data.ordered_calls,
+            &data.function_names,
+            &mut visit_counts,
+        );
+
+        // Check if the summary matches the path pattern
+        if let Some(pattern) = path_pattern {
+            if matches_path_pattern(&summary, pattern) {
+                results.push(summary);
+            }
+        } else {
+            results.push(summary);
+        }
+    }
+
+    results.sort();
+    results
+}
+
+/// Check if a call summary matches a path pattern.
+/// Pattern is a sequence of function names that must appear in order in the summary.
+/// For example, pattern ["X", "C", "B"] matches "X{A{C,D},B}" because X appears,
+/// then C appears somewhere after, then B appears after C.
+fn matches_path_pattern(summary: &str, pattern: &[String]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+
+    // Extract all function names in order from the summary
+    let names = extract_names_in_order(summary);
+    
+    // Check if pattern elements appear in order in names
+    let mut pattern_idx = 0;
+    for name in &names {
+        if pattern_idx < pattern.len() && name == &pattern[pattern_idx] {
+            pattern_idx += 1;
+        }
+    }
+
+    pattern_idx == pattern.len()
+}
+
+/// Extract function names from a summary in the order they appear.
+/// For "X{A{C,D},B}", returns ["X", "A", "C", "D", "B"]
+fn extract_names_in_order(summary: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current_name = String::new();
+
+    for ch in summary.chars() {
+        match ch {
+            '{' | '}' | ',' => {
+                if !current_name.is_empty() {
+                    names.push(current_name.clone());
+                    current_name.clear();
+                }
+            }
+            _ => {
+                current_name.push(ch);
+            }
+        }
+    }
+
+    if !current_name.is_empty() {
+        names.push(current_name);
+    }
+
+    names
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -354,7 +514,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let show_filename = args.filename.unwrap_or(args.files.len() > 1);
 
     let mut total_paths = 0;
-    let has_filter = !args.src.is_empty() || !args.dst.is_empty();
+    
+    // Parse path pattern if --paths was provided with a non-empty value
+    let path_pattern: Option<Vec<String>> = match &args.paths {
+        Some(pattern) if !pattern.is_empty() => {
+            Some(pattern.split("..").map(|s| s.to_string()).collect())
+        }
+        _ => None,
+    };
+
+    let use_paths_mode = args.paths.is_some();
+    let has_filter = !args.src.is_empty() || !args.dst.is_empty() || path_pattern.is_some();
 
     for file_path in &args.files {
         let wasm_bytes = fs::read(file_path)?;
@@ -364,17 +534,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(file_path);
 
         let data = parse_wasm_module(&wasm_bytes, env_symbol_map.as_ref())?;
-        let chains = enumerate_call_chains(&data, &args.src, &args.dst, args.leaves_only);
 
-        for chain in &chains {
-            if show_filename {
-                println!("{}:{}", filename, chain);
-            } else {
-                println!("{}", chain);
+        if use_paths_mode {
+            let summaries = generate_call_paths(
+                &data,
+                &args.src,
+                path_pattern.as_deref(),
+            );
+
+            for summary in &summaries {
+                if show_filename {
+                    println!("{}:{}", filename, summary);
+                } else {
+                    println!("{}", summary);
+                }
             }
-        }
+            total_paths += summaries.len();
+        } else {
+            let chains = enumerate_call_chains(&data, &args.src, &args.dst, args.leaves_only);
 
-        total_paths += chains.len();
+            for chain in &chains {
+                if show_filename {
+                    println!("{}:{}", filename, chain);
+                } else {
+                    println!("{}", chain);
+                }
+            }
+            total_paths += chains.len();
+        }
     }
 
     // Exit with code 1 if filters were applied and no paths matched
@@ -919,5 +1106,318 @@ mod tests {
         assert!(chains.contains(&"a,log".to_string()));
         assert!(chains.contains(&"b,log".to_string()));
         assert_eq!(chains.len(), 2);
+    }
+
+    // ============================================================
+    // Tests for --paths mode (sequential call summaries)
+    // ============================================================
+
+    #[test]
+    fn test_paths_simple_chain() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $a (call $b))
+                (func $b (call $c))
+                (func $c)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &[], None);
+
+        // a calls b, b calls c, c calls nothing
+        assert!(paths.contains(&"a{b{c}}".to_string()));
+        assert!(paths.contains(&"b{c}".to_string()));
+        assert!(paths.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_paths_multiple_calls() {
+        // X calls A and then B, A calls C and D
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $X (call $A) (call $B))
+                (func $A (call $C) (call $D))
+                (func $B)
+                (func $C)
+                (func $D)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["X".to_string()], None);
+
+        // X{A{C,D},B}
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "X{A{C,D},B}");
+    }
+
+    #[test]
+    fn test_paths_pattern_matching() {
+        // X calls A and then B, A calls C and D
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $X (call $A) (call $B))
+                (func $A (call $C) (call $D))
+                (func $B)
+                (func $C)
+                (func $D)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+
+        // Pattern X..C..B should match X{A{C,D},B} because C appears before B
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "C".to_string(), "B".to_string()]));
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "X{A{C,D},B}");
+
+        // Pattern X..B should match
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "B".to_string()]));
+        assert_eq!(paths.len(), 1);
+
+        // Pattern X..B..D should NOT match (B appears before D in the pattern, but D appears before B in summary)
+        let paths = generate_call_paths(&data, &["X".to_string()], Some(&["X".to_string(), "B".to_string(), "D".to_string()]));
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_paths_direct_recursion() {
+        // A function that calls itself (direct recursion)
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $recursive (call $recursive))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &[], None);
+
+        // Should unroll twice: recursive{recursive{recursive}}
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "recursive{recursive{recursive}}");
+    }
+
+    #[test]
+    fn test_paths_indirect_recursion() {
+        // A calls B, B calls A (indirect recursion)
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $a (call $b))
+                (func $b (call $a))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["a".to_string()], None);
+
+        // From a: a{b{a{b{a}}}}
+        // Wait, let's think: a calls b, b calls a, a calls b (2nd time), b calls a (2nd time), a is at limit
+        // Actually with visit count tracking: a(1)->b(1)->a(2)->b(2)->a(at limit, return just "a")
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "a{b{a{b{a}}}}");
+    }
+
+    #[test]
+    fn test_paths_loop_body_calls() {
+        // Function with a loop that makes multiple calls
+        // We simulate this with repeated calls in the bytecode
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $loop_func (call $helper) (call $helper))
+                (func $helper)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["loop_func".to_string()], None);
+
+        // Two calls to helper should appear
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "loop_func{helper,helper}");
+    }
+
+    #[test]
+    fn test_paths_complex_with_loop() {
+        // Complex case with calls and a loop
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $main (call $setup) (call $process) (call $process) (call $cleanup))
+                (func $setup)
+                (func $process (call $helper))
+                (func $cleanup)
+                (func $helper)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["main".to_string()], None);
+
+        // main calls setup, process (with helper), process again (with helper), cleanup
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "main{setup,process{helper},process{helper},cleanup}");
+    }
+
+    #[test]
+    fn test_paths_diamond_pattern() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $a (call $b) (call $c))
+                (func $b (call $d))
+                (func $c (call $d))
+                (func $d)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["a".to_string()], None);
+
+        // a calls b (which calls d), then c (which calls d)
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "a{b{d},c{d}}");
+    }
+
+    #[test]
+    fn test_paths_with_imports() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (import "env" "log" (func $log))
+                (func $main (call $log) (call $helper))
+                (func $helper (call $log))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["main".to_string()], None);
+
+        // main calls log, then helper (which calls log)
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "main{log,helper{log}}");
+    }
+
+    #[test]
+    fn test_extract_names_in_order() {
+        assert_eq!(
+            extract_names_in_order("X{A{C,D},B}"),
+            vec!["X", "A", "C", "D", "B"]
+        );
+        assert_eq!(
+            extract_names_in_order("a{b{c}}"),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            extract_names_in_order("simple"),
+            vec!["simple"]
+        );
+        assert_eq!(
+            extract_names_in_order("a{b,c,d}"),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn test_matches_path_pattern() {
+        // X{A{C,D},B} -> names: X, A, C, D, B
+        let summary = "X{A{C,D},B}";
+
+        // X..C..B: X appears, then C, then B - should match
+        assert!(matches_path_pattern(summary, &["X".to_string(), "C".to_string(), "B".to_string()]));
+
+        // X..B: X appears, then B - should match
+        assert!(matches_path_pattern(summary, &["X".to_string(), "B".to_string()]));
+
+        // X..B..D: X, then B, then D - should NOT match (D comes before B in summary)
+        assert!(!matches_path_pattern(summary, &["X".to_string(), "B".to_string(), "D".to_string()]));
+
+        // X..A..C: should match
+        assert!(matches_path_pattern(summary, &["X".to_string(), "A".to_string(), "C".to_string()]));
+
+        // Z..A: should NOT match (Z is not in summary)
+        assert!(!matches_path_pattern(summary, &["Z".to_string(), "A".to_string()]));
+
+        // Empty pattern should match everything
+        assert!(matches_path_pattern(summary, &[]));
+    }
+
+    #[test]
+    fn test_paths_three_level_recursion() {
+        // a -> b -> c -> a (cycle of 3)
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $a (call $b))
+                (func $b (call $c))
+                (func $c (call $a))
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &["a".to_string()], None);
+
+        // a(1)->b(1)->c(1)->a(2)->b(2)->c(2)->a(at limit)
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "a{b{c{a{b{c{a}}}}}}");
+    }
+
+    #[test]
+    fn test_paths_no_calls() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $leaf)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        let paths = generate_call_paths(&data, &[], None);
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "leaf");
+    }
+
+    #[test]
+    fn test_paths_src_filter() {
+        let wasm = parse_wat(
+            r#"
+            (module
+                (func $a (call $c))
+                (func $b (call $c))
+                (func $c)
+            )
+            "#,
+        );
+
+        let data = parse_wasm_module(&wasm, None).unwrap();
+        
+        // Only from a
+        let paths = generate_call_paths(&data, &["a".to_string()], None);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "a{c}");
+
+        // From both a and b
+        let paths = generate_call_paths(&data, &["a".to_string(), "b".to_string()], None);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"a{c}".to_string()));
+        assert!(paths.contains(&"b{c}".to_string()));
     }
 }
